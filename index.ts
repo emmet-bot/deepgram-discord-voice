@@ -171,19 +171,18 @@ const discordVoicePlugin = {
     });
 
     // Ensure Discord client is destroyed on process exit (prevents zombie processes)
+    // Use 'exit' event which fires regardless of how the process ends
     const cleanupOnExit = () => {
-      if (discordClient) {
-        discordClient.destroy();
-        discordClient = null;
-      }
-      if (voiceManager) {
-        voiceManager.destroy().catch(() => {});
-        voiceManager = null;
-      }
+      try {
+        if (discordClient) {
+          discordClient.destroy();
+          discordClient = null;
+        }
+      } catch (_) {}
     };
-    process.once("SIGTERM", cleanupOnExit);
-    process.once("SIGINT", cleanupOnExit);
-    process.once("beforeExit", cleanupOnExit);
+    process.on("exit", cleanupOnExit);
+    process.once("SIGTERM", () => { cleanupOnExit(); process.exit(0); });
+    process.once("SIGINT", () => { cleanupOnExit(); process.exit(0); });
 
     /**
      * Handle transcribed speech - route to agent and get response
