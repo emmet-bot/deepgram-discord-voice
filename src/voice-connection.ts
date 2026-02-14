@@ -39,6 +39,14 @@ import { createSTTProvider, type STTProvider } from "./stt.js";
 import { createStreamingSTTProvider, StreamingSTTManager } from "./streaming-stt.js";
 import { createTTSProvider, type TTSProvider } from "./tts.js";
 import { createStreamingTTSProvider, type StreamingTTSProvider } from "./streaming-tts.js";
+import {
+  streamLLMResponse,
+  addUserMessage,
+  addAssistantMessage,
+  getHistory,
+  resolveAnthropicApiKey,
+  type StreamHandle,
+} from "./streaming-pipeline.js";
 
 /** Minimal logger interface used by this plugin */
 export interface Logger {
@@ -80,6 +88,9 @@ export interface VoiceSession {
   heartbeatInterval?: ReturnType<typeof setInterval>;
   lastHeartbeat?: number;
   reconnecting?: boolean;
+  activeStreamHandle?: StreamHandle;  // Current streaming LLM handle (for abort on barge-in)
+  audioQueue: Array<() => Promise<void>>;  // Queue of TTS play functions
+  playingQueue: boolean;  // Whether the queue is currently draining
 }
 
 export class VoiceConnectionManager {
@@ -92,12 +103,14 @@ export class VoiceConnectionManager {
   private logger: Logger;
   private onTranscript: (userId: string, guildId: string, channelId: string, text: string) => Promise<string>;
   private botUserId: string | null = null;
+  private anthropicApiKey: string | null = null;
+  private systemPrompt: string = "";
 
   // Heartbeat configuration (can be overridden via config.heartbeatIntervalMs)
   private readonly DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;  // 30 seconds
   private readonly HEARTBEAT_TIMEOUT_MS = 60_000;   // 60 seconds before reconnect
   private readonly MAX_RECONNECT_ATTEMPTS = 3;
-  
+
   private get HEARTBEAT_INTERVAL_MS(): number {
     return this.config.heartbeatIntervalMs ?? this.DEFAULT_HEARTBEAT_INTERVAL_MS;
   }
@@ -112,6 +125,21 @@ export class VoiceConnectionManager {
     this.logger = logger;
     this.onTranscript = onTranscript;
     this.botUserId = botUserId || null;
+
+    // Resolve Anthropic API key for streaming LLM pipeline
+    if (config.streamingLLM) {
+      this.anthropicApiKey = resolveAnthropicApiKey(config);
+      if (!this.anthropicApiKey) {
+        this.logger.warn("[discord-voice] streamingLLM enabled but no Anthropic API key found — will fall back to batch");
+      }
+    }
+  }
+
+  /**
+   * Set the system prompt for the streaming LLM pipeline
+   */
+  setSystemPrompt(prompt: string): void {
+    this.systemPrompt = prompt;
   }
   
   /**
@@ -180,6 +208,8 @@ export class VoiceConnectionManager {
       speaking: false,
       processing: false,
       lastHeartbeat: Date.now(),
+      audioQueue: [],
+      playingQueue: false,
     };
 
     this.sessions.set(channel.guildId, session);
@@ -405,19 +435,26 @@ export class VoiceConnectionManager {
       // ═══════════════════════════════════════════════════════════════
       if (session.speaking) {
         if (this.config.bargeIn) {
-          this.logger.info(`[discord-voice] Barge-in detected from user ${userId}! Stopping speech.`);
-          this.stopSpeaking(session);
-          session.lastSpokeAt = Date.now();
+          // Debounce barge-in: require sustained speech before interrupting
+          const BARGE_IN_DELAY_MS = 1500;
+          const bargeKey = `barge_${userId}`;
+          if (!(session as any)[bargeKey]) {
+            (session as any)[bargeKey] = setTimeout(() => {
+              delete (session as any)[bargeKey];
+              if (session.speaking) {
+                this.logger.info(`[discord-voice] Barge-in confirmed from user ${userId}! Stopping speech.`);
+                this.stopSpeaking(session);
+                session.lastSpokeAt = Date.now();
+              }
+            }, BARGE_IN_DELAY_MS);
+          }
         }
-        // Clear streaming transcripts and wait for next speech event
-        if (this.streamingSTT) {
-          this.streamingSTT.closeSession(userId);
-        }
-        return;
+        // Don't return — fall through to start recording the new speech
+        // so it gets processed after barge-in completes
       }
       
-      if (session.processing) {
-        // While processing a request, don't start new recordings
+      if (session.processing && !session.speaking) {
+        // Only ignore if genuinely processing (not mid-barge-in)
         if (this.streamingSTT) {
           this.streamingSTT.closeSession(userId);
         }
@@ -456,6 +493,14 @@ export class VoiceConnectionManager {
       }
 
       this.logger.debug?.(`[discord-voice] User ${userId} stopped speaking`);
+
+      // Cancel pending barge-in if user stopped quickly
+      const bargeKey = `barge_${userId}`;
+      if ((session as any)[bargeKey]) {
+        clearTimeout((session as any)[bargeKey]);
+        delete (session as any)[bargeKey];
+        this.logger.debug?.(`[discord-voice] Barge-in cancelled (user stopped speaking quickly)`);
+      }
       
       const state = session.userAudioStates.get(userId);
       if (!state || !state.isRecording) {
@@ -490,11 +535,21 @@ export class VoiceConnectionManager {
    * Stop any current speech output (for barge-in)
    */
   private stopSpeaking(session: VoiceSession): void {
+    // Abort active streaming LLM request
+    if (session.activeStreamHandle) {
+      session.activeStreamHandle.abort();
+      session.activeStreamHandle = undefined;
+    }
+
+    // Clear audio queue
+    session.audioQueue.length = 0;
+    session.playingQueue = false;
+
     // Stop main player
     if (session.player.state.status !== AudioPlayerStatus.Idle) {
       session.player.stop(true);
     }
-    
+
     // Stop thinking player if active
     if (session.thinkingPlayer && session.thinkingPlayer.state.status !== AudioPlayerStatus.Idle) {
       session.thinkingPlayer.stop(true);
@@ -503,6 +558,7 @@ export class VoiceConnectionManager {
     }
 
     session.speaking = false;
+    session.processing = false;  // Allow new speech to be processed after barge-in
   }
 
   /**
@@ -668,6 +724,15 @@ export class VoiceConnectionManager {
         return;
       }
 
+      // Filter out noise/filler that isn't real speech
+      const cleaned = transcribedText.trim().toLowerCase().replace(/[^a-z0-9\s]/g, '');
+      const NOISE_PATTERNS = /^(uh|um|hmm|hm|ah|oh|mhm|uh huh|mm|okay|ok)?$/;
+      if (cleaned.length < 3 || NOISE_PATTERNS.test(cleaned)) {
+        this.logger.debug?.(`[discord-voice] Skipping noise/filler: "${transcribedText}"`);
+        session.processing = false;
+        return;
+      }
+
       this.logger.info(`[discord-voice] Transcribed: "${transcribedText}"`);
 
       // Voice command: primary speaker can switch who is allowed to talk
@@ -681,29 +746,89 @@ export class VoiceConnectionManager {
         return;
       }
 
-      // Play looping thinking sound while processing
-      const stopThinking = await this.startThinkingLoop(session);
+      // Decide: streaming LLM pipeline or batch
+      const useStreamingLLM = this.config.streamingLLM && this.anthropicApiKey && this.streamingTTS;
 
-      let response: string;
-      try {
-        // Get response from agent
-        response = await this.onTranscript(userId, session.guildId, session.channelId, transcribedText);
-      } finally {
-        // Always stop thinking sound, even on error
-        stopThinking();
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-      
-      if (!response || response.trim().length === 0) {
-        session.processing = false;
-        return;
-      }
+      if (useStreamingLLM) {
+        // ═══════════════════════════════════════════════════════════════
+        // STREAMING PATH: LLM → sentence chunks → TTS → queue playback
+        // ═══════════════════════════════════════════════════════════════
+        const model = this.config.model || "claude-sonnet-4-5-20250929";
+        const maxHistory = this.config.conversationHistoryLength;
 
-      // Ensure main player is subscribed before speaking
-      session.connection.subscribe(session.player);
-      
-      // Synthesize and play response
-      await this.speak(session.guildId, response);
+        addUserMessage(session.guildId, transcribedText, maxHistory);
+        const messages = getHistory(session.guildId);
+
+        session.speaking = true;
+        session.startedSpeakingAt = Date.now();
+        session.connection.subscribe(session.player);
+
+        await new Promise<void>((resolve, reject) => {
+          const handle = streamLLMResponse(messages, {
+            apiKey: this.anthropicApiKey!,
+            model,
+            systemPrompt: this.systemPrompt,
+            onSentence: (sentence) => {
+              this.logger.debug?.(`[discord-voice] Streaming sentence: "${sentence.substring(0, 60)}..."`);
+              this.enqueueTTSChunk(session, sentence);
+            },
+            onComplete: (fullText) => {
+              addAssistantMessage(session.guildId, fullText, maxHistory);
+              // Wait for audio queue to drain, then resolve
+              this.waitForQueueDrain(session).then(resolve, reject);
+            },
+            onError: (error) => {
+              this.logger.error(`[discord-voice] Streaming LLM error: ${error.message}`);
+              // Fall back to batch on stream error
+              session.speaking = false;
+              session.activeStreamHandle = undefined;
+              this.fallbackBatchResponse(session, userId, transcribedText).then(resolve, reject);
+            },
+          });
+
+          session.activeStreamHandle = handle;
+        });
+
+        session.activeStreamHandle = undefined;
+      } else {
+        // ═══════════════════════════════════════════════════════════════
+        // BATCH PATH: Original flow via runEmbeddedPiAgent
+        // With conversation context prepended for continuity
+        // ═══════════════════════════════════════════════════════════════
+        const maxHistory = this.config.conversationHistoryLength;
+        const history = getHistory(session.guildId);
+
+        // Build context-enriched transcript for the LLM
+        let enrichedTranscript = transcribedText;
+        if (history.length > 0) {
+          const contextLines = history.slice(-6).map(m =>
+            `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`
+          ).join('\n');
+          enrichedTranscript = `[Recent voice conversation context]\n${contextLines}\n\n[Current message]\nUser: ${transcribedText}`;
+        }
+
+        addUserMessage(session.guildId, transcribedText, maxHistory);
+
+        const stopThinking = await this.startThinkingLoop(session);
+
+        let response: string;
+        try {
+          response = await this.onTranscript(userId, session.guildId, session.channelId, enrichedTranscript);
+        } finally {
+          stopThinking();
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        if (!response || response.trim().length === 0) {
+          session.processing = false;
+          return;
+        }
+
+        addAssistantMessage(session.guildId, response, maxHistory);
+
+        session.connection.subscribe(session.player);
+        await this.speak(session.guildId, response);
+      }
     } catch (error) {
       this.logger.error(`[discord-voice] Error processing audio: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -715,6 +840,22 @@ export class VoiceConnectionManager {
    * Speak text in the voice channel
    */
   async speak(guildId: string, text: string): Promise<void> {
+    // Strip markdown for clean voice output
+    text = text
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/__([^_]+)__/g, '$1')
+      .replace(/_([^_]+)_/g, '$1')
+      .replace(/~~([^~]+)~~/g, '$1')
+      .replace(/^#{1,6}\s+/gm, '')
+      .replace(/^\s*[-*+]\s+/gm, '')
+      .replace(/^\s*\d+\.\s+/gm, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
     const session = this.sessions.get(guildId);
     if (!session) {
       throw new Error("Not connected to voice channel");
@@ -779,6 +920,13 @@ export class VoiceConnectionManager {
 
       // Wait for playback to finish
       await new Promise<void>((resolve) => {
+        // If player is already idle (e.g. very short audio), resolve immediately
+        if (session.player.state.status === AudioPlayerStatus.Idle) {
+          session.speaking = false;
+          session.lastSpokeAt = Date.now();
+          resolve();
+          return;
+        }
         const onIdle = () => {
           session.speaking = false;
           session.lastSpokeAt = Date.now(); // Set cooldown timestamp
@@ -798,11 +946,107 @@ export class VoiceConnectionManager {
 
         session.player.on(AudioPlayerStatus.Idle, onIdle);
         session.player.on("error", onError);
+
+        // Safety timeout: if playback doesn't complete in 60s, force resolve
+        setTimeout(() => {
+          if (session.speaking) {
+            this.logger.warn(`[discord-voice] Playback safety timeout — forcing speaking=false`);
+            session.speaking = false;
+            session.lastSpokeAt = Date.now();
+            session.player.off(AudioPlayerStatus.Idle, onIdle);
+            session.player.off("error", onError);
+            resolve();
+          }
+        }, 60000);
       });
     } catch (error) {
       session.speaking = false;
       session.lastSpokeAt = Date.now(); // Set cooldown timestamp
       throw error;
+    }
+  }
+
+  /**
+   * Enqueue a TTS chunk for sequential playback
+   */
+  private enqueueTTSChunk(session: VoiceSession, text: string): void {
+    session.audioQueue.push(async () => {
+      if (!this.streamingTTS) return;
+      try {
+        const streamResult = await this.streamingTTS.synthesizeStream(text);
+        const resource = createAudioResource(streamResult.stream, {
+          inputType: StreamType.OggOpus,
+        });
+        session.player.play(resource);
+
+        // Wait for this chunk to finish playing
+        await new Promise<void>((resolve) => {
+          const onIdle = () => {
+            session.player.off(AudioPlayerStatus.Idle, onIdle);
+            session.player.off("error", onErr);
+            resolve();
+          };
+          const onErr = (error: Error) => {
+            this.logger.error(`[discord-voice] Queue playback error: ${error.message}`);
+            session.player.off(AudioPlayerStatus.Idle, onIdle);
+            session.player.off("error", onErr);
+            resolve();
+          };
+          session.player.on(AudioPlayerStatus.Idle, onIdle);
+          session.player.on("error", onErr);
+        });
+      } catch (err) {
+        this.logger.error(`[discord-voice] TTS chunk error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
+
+    // Start draining if not already
+    if (!session.playingQueue) {
+      this.drainAudioQueue(session);
+    }
+  }
+
+  /**
+   * Drain the audio queue sequentially
+   */
+  private async drainAudioQueue(session: VoiceSession): Promise<void> {
+    if (session.playingQueue) return;
+    session.playingQueue = true;
+
+    while (session.audioQueue.length > 0) {
+      const next = session.audioQueue.shift();
+      if (next) {
+        await next();
+      }
+    }
+
+    session.playingQueue = false;
+  }
+
+  /**
+   * Wait for the audio queue to fully drain
+   */
+  private async waitForQueueDrain(session: VoiceSession): Promise<void> {
+    // Poll until queue is empty and not playing
+    while (session.audioQueue.length > 0 || session.playingQueue) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    session.speaking = false;
+    session.lastSpokeAt = Date.now();
+  }
+
+  /**
+   * Fallback to batch response when streaming fails
+   */
+  private async fallbackBatchResponse(session: VoiceSession, userId: string, text: string): Promise<void> {
+    try {
+      const response = await this.onTranscript(userId, session.guildId, session.channelId, text);
+      if (response && response.trim().length > 0) {
+        session.connection.subscribe(session.player);
+        await this.speak(session.guildId, response);
+      }
+    } catch (err) {
+      this.logger.error(`[discord-voice] Fallback batch error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

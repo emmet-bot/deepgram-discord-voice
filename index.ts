@@ -277,6 +277,25 @@ const discordVoicePlugin = {
       if (!voiceManager) {
         const botUserId = discordClient?.user?.id;
         voiceManager = new VoiceConnectionManager(cfg, api.logger, handleTranscript, botUserId);
+
+        // Set up streaming LLM system prompt if enabled
+        if (cfg.streamingLLM) {
+          // Resolve agent name for the system prompt (async, best-effort)
+          loadCoreAgentDeps()
+            .then((deps) => {
+              const coreConfig = api.config as CoreConfig;
+              const identity = deps.resolveAgentIdentity(coreConfig, "main");
+              const agentName = identity?.name?.trim() || "assistant";
+              voiceManager?.setSystemPrompt(
+                `You are ${agentName}, speaking in a Discord voice channel. Keep responses brief and conversational (1-2 sentences max). Be natural and friendly. Do not use markdown formatting, bullet points, or numbered lists — speak naturally as in a conversation.`
+              );
+            })
+            .catch(() => {
+              voiceManager?.setSystemPrompt(
+                "You are an assistant speaking in a Discord voice channel. Keep responses brief and conversational (1-2 sentences max). Be natural and friendly. Do not use markdown formatting, bullet points, or numbered lists — speak naturally as in a conversation."
+              );
+            });
+        }
       }
       return voiceManager;
     }
@@ -580,6 +599,11 @@ const discordVoicePlugin = {
         if (voiceManager) {
           await voiceManager.destroy();
           voiceManager = null;
+        }
+        if (discordClient) {
+          discordClient.destroy();
+          discordClient = null;
+          api.logger.info("[deepgram-discord-voice] Discord client destroyed");
         }
         api.logger.info("[deepgram-discord-voice] Service stopped");
       },

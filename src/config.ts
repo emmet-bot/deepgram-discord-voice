@@ -41,6 +41,11 @@ export interface DiscordVoiceConfig {
   model?: string;
   thinkLevel?: string;
 
+  // Streaming LLM → TTS pipeline (bypasses batch agent for lower latency)
+  streamingLLM: boolean;
+  anthropicApiKey?: string;
+  conversationHistoryLength: number;
+
   deepgram?: DeepgramConfig;
 }
 
@@ -59,6 +64,8 @@ export const DEFAULT_CONFIG: DiscordVoiceConfig = {
   minAudioMs: 300,
   maxRecordingMs: 30_000,
   heartbeatIntervalMs: 30_000,
+  streamingLLM: true,
+  conversationHistoryLength: 10,
 };
 
 export function parseConfig(raw: unknown): DiscordVoiceConfig {
@@ -87,6 +94,9 @@ export function parseConfig(raw: unknown): DiscordVoiceConfig {
     heartbeatIntervalMs: typeof obj.heartbeatIntervalMs === "number" ? obj.heartbeatIntervalMs : DEFAULT_CONFIG.heartbeatIntervalMs,
     model: typeof obj.model === "string" && obj.model.trim() ? obj.model.trim() : undefined,
     thinkLevel: typeof obj.thinkLevel === "string" && obj.thinkLevel.trim() ? obj.thinkLevel.trim() : undefined,
+    streamingLLM: typeof obj.streamingLLM === "boolean" ? obj.streamingLLM : DEFAULT_CONFIG.streamingLLM,
+    anthropicApiKey: typeof obj.anthropicApiKey === "string" && obj.anthropicApiKey.trim() ? obj.anthropicApiKey.trim() : undefined,
+    conversationHistoryLength: typeof obj.conversationHistoryLength === "number" ? obj.conversationHistoryLength : DEFAULT_CONFIG.conversationHistoryLength,
     deepgram: deepgramRaw ? {
       apiKey: typeof deepgramRaw.apiKey === "string" ? deepgramRaw.apiKey : undefined,
       sttModel: typeof deepgramRaw.sttModel === "string" && deepgramRaw.sttModel.trim() ? deepgramRaw.sttModel.trim() : "nova-2",

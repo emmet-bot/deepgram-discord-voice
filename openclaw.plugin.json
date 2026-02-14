@@ -112,6 +112,20 @@
         "type": "string",
         "default": "openclaw",
         "description": "Wake word for voice commands like 'openclaw allow John'"
+      },
+      "streamingLLM": {
+        "type": "boolean",
+        "default": true,
+        "description": "Use streaming LLM pipeline (direct Anthropic API) for lower voice latency"
+      },
+      "anthropicApiKey": {
+        "type": "string",
+        "description": "Anthropic API key (optional, auto-resolved from env/credentials)"
+      },
+      "conversationHistoryLength": {
+        "type": "number",
+        "default": 10,
+        "description": "Number of conversation messages to keep per guild"
       }
     }
   },
