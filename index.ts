@@ -170,6 +170,21 @@ const discordVoicePlugin = {
       api.logger.error(`[deepgram-discord-voice] Failed to login: ${err instanceof Error ? err.message : String(err)}`);
     });
 
+    // Ensure Discord client is destroyed on process exit (prevents zombie processes)
+    const cleanupOnExit = () => {
+      if (discordClient) {
+        discordClient.destroy();
+        discordClient = null;
+      }
+      if (voiceManager) {
+        voiceManager.destroy().catch(() => {});
+        voiceManager = null;
+      }
+    };
+    process.once("SIGTERM", cleanupOnExit);
+    process.once("SIGINT", cleanupOnExit);
+    process.once("beforeExit", cleanupOnExit);
+
     /**
      * Handle transcribed speech - route to agent and get response
      */
