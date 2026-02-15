@@ -33,6 +33,9 @@ export interface DiscordVoiceConfig {
   minAudioMs: number;
   maxRecordingMs: number;
 
+  // Security: require specific user(s) to be present in the channel before joining
+  requirePresence?: string[]; // Discord user IDs that must be in the channel
+
   // Optional features
   autoJoinChannel?: string;
   heartbeatIntervalMs?: number;
@@ -90,6 +93,7 @@ export function parseConfig(raw: unknown): DiscordVoiceConfig {
     silenceThresholdMs: typeof obj.silenceThresholdMs === "number" ? obj.silenceThresholdMs : DEFAULT_CONFIG.silenceThresholdMs,
     minAudioMs: typeof obj.minAudioMs === "number" ? obj.minAudioMs : DEFAULT_CONFIG.minAudioMs,
     maxRecordingMs: typeof obj.maxRecordingMs === "number" ? obj.maxRecordingMs : DEFAULT_CONFIG.maxRecordingMs,
+    requirePresence: Array.isArray(obj.requirePresence) ? obj.requirePresence.filter((u): u is string => typeof u === "string") : undefined,
     autoJoinChannel: typeof obj.autoJoinChannel === "string" && obj.autoJoinChannel.trim() ? obj.autoJoinChannel.trim() : undefined,
     heartbeatIntervalMs: typeof obj.heartbeatIntervalMs === "number" ? obj.heartbeatIntervalMs : DEFAULT_CONFIG.heartbeatIntervalMs,
     model: typeof obj.model === "string" && obj.model.trim() ? obj.model.trim() : undefined,

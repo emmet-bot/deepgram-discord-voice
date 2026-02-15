@@ -345,6 +345,23 @@ const discordVoicePlugin = {
           return;
         }
 
+        // Security: check requirePresence before joining
+        if (cfg.requirePresence && cfg.requirePresence.length > 0) {
+          const voiceChannel = channel as VoiceBasedChannel;
+          const membersInChannel = voiceChannel.members;
+          const missing = cfg.requirePresence.filter(
+            (uid) => !membersInChannel.has(uid)
+          );
+          if (missing.length > 0) {
+            respond(false, {
+              joined: false,
+              error: "Required user(s) not present in voice channel",
+              missingUsers: missing,
+            });
+            return;
+          }
+        }
+
         const vm = ensureVoiceManager();
         const session = await vm.join(channel as VoiceBasedChannel);
         
@@ -452,6 +469,22 @@ const discordVoicePlugin = {
               if (!channel || !("guild" in channel) || !channel.isVoiceBased()) {
                 throw new Error("Invalid voice channel");
               }
+
+              // Security: check requirePresence before joining
+              if (cfg.requirePresence && cfg.requirePresence.length > 0) {
+                const voiceChannel = channel as VoiceBasedChannel;
+                const membersInChannel = voiceChannel.members;
+                const missing = cfg.requirePresence.filter(
+                  (uid) => !membersInChannel.has(uid)
+                );
+                if (missing.length > 0) {
+                  return json({
+                    joined: false,
+                    error: "Required user(s) not present in voice channel",
+                    missingUsers: missing,
+                  });
+                }
+              }
               
               const session = await vm.join(channel as VoiceBasedChannel);
               return json({ joined: true, guildId: session.guildId, channelId: session.channelId });
@@ -549,6 +582,19 @@ const discordVoicePlugin = {
               if (!channel || !("guild" in channel) || !channel.isVoiceBased()) {
                 console.error("Invalid voice channel");
                 return;
+              }
+
+              // Security: check requirePresence before joining
+              if (cfg.requirePresence && cfg.requirePresence.length > 0) {
+                const voiceChannel = channel as VoiceBasedChannel;
+                const membersInChannel = voiceChannel.members;
+                const missing = cfg.requirePresence.filter(
+                  (uid) => !membersInChannel.has(uid)
+                );
+                if (missing.length > 0) {
+                  console.error(`Required user(s) not in channel: ${missing.join(", ")}`);
+                  return;
+                }
               }
 
               const vm = ensureVoiceManager();
