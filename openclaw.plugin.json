@@ -162,6 +162,10 @@
       "label": "Allowed Users",
       "help": "Discord user IDs allowed to use voice (empty = all allowed)"
     },
+    "requirePresence": {
+      "label": "Require User Presence",
+      "help": "Discord user IDs that must be in the voice channel before the bot joins. The bot will refuse to join if any listed user is absent. Useful for security — prevents the bot from joining channels without an authorized user present."
+    },
     "deepgram.apiKey": {
       "label": "Deepgram API Key",
       "sensitive": true
