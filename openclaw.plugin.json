@@ -61,6 +61,13 @@
         },
         "default": []
       },
+      "requirePresence": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Discord user IDs that must be present in the voice channel before the bot will join. Security feature to prevent joining empty/unauthorized channels."
+      },
       "silenceThresholdMs": {
         "type": "number",
         "default": 1000
